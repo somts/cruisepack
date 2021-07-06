@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+
+'''cruisepack
+  Take the contents of a directory and turn each supplied argument
+  into a tarball, md5sum and log file. If you are archiving a
+  dataset of 10GB, it is recommended you run this script in `screen`.
+
+ EXAMPLE:
+  cruisepack -s /share/cruises/foo/BAR1213 /share/cruises/foo/BAZ1214
+   ... would make:
+     /share/cruises/foo/BAR1213.zip
+     /share/cruises/foo/BAR1213.log.txt
+     /share/cruises/foo/BAR1213.md5.txt
+     /share/cruises/foo/BAZ1214.zip
+     /share/cruises/foo/BAZ1214.log.txt
+     /share/cruises/foo/BAZ1214.md5.txt
+
+ It would be up to the user to delete /share/cruises/foo/BAR1213 and
+ /share/cruises/foo/BAZ1214 in an effort to clean up space.
+ '''
+
+import argparse
+import collections
+import hashlib
+import logging
+import logging.handlers
+import os
+import tarfile
+import time
+import sys
+from zipfile import ZipFile, ZIP_BZIP2, ZIP_LZMA
+from multiprocessing import cpu_count
+from multiprocessing import Pool
+from pathlib import Path
+
+
+def bytes2human(n):
+    symbols = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
+    prefix = {}
+    for i, s in enumerate(symbols):
+        prefix[s] = 1 << (i+1)*10
+    for s in reversed(symbols):
+        if n >= prefix[s]:
+            value = float(n) / prefix[s]
+            return '%.1f%sB' % (value, s)
+    return '%sB' % n
+
+
+class CPError(Exception):
+    '''Hack our own fatal error class'''
+    def __init__(self, errmsg, exception=None):
+        super().__init__()
+        self.errmsg = errmsg
+        self.exception = exception
+
+    def __str__(self):
+        if self.exception is not None:
+            return '\n\t'.join((self.errmsg, '%s' % self.exception))
+        return self.errmsg
+
+
+class CruisePack:
+    '''Set up a class to pack cruise data'''
+
+    def __init__(self):
+        self.args = self.validate_args(self.parseargs())
+
+        # Set up console logging
+        self.formatter = logging.Formatter(
+            '%(asctime)s %(levelname)7s: %(message)s')
+        self.logger = self.getlogger()
+
+        self.logger.info(self.args.__dict__)
+
+        for i, srcdir in enumerate(self.args.source_dir):
+            self.pack_cruise(srcdir, self.args.dstlog[i],
+                             self.args.dstmd5[i], self.args.dstzip[i])
+
+    def chkdst(self, dstfiles):
+        '''Check to see if destination files exist and decide what to
+           about it'''
+        process = False
+        for i in dstfiles:
+            if not os.path.exists(i):  # good to go
+                process = True
+            elif self.args.overwrite_destination == True:  # also good
+                # Avoid overwriting file(s) if we did not call for it
+                self.logger.warning(
+                    '%s exists; overwrite_destination is enabled. Overwriting!',
+                    i)
+                process = True
+            else:
+                # Avoid overwriting file(s) if we did not call for it
+                self.logger.error(
+                    '%s exists and overwrite_destination not set.',
+                    i)
+                process = False
+        if process is False:
+            self.logger.warning('Exiting due to exisiting files.')
+            sys.exit(1)
+
+    def pack_cruise(self, srcdir, dstlog, dstmd5, dstzip):
+        '''Dig through a dir, md5sum every file and archive the dir'''
+        atime = time.perf_counter()
+        disclaimer = '(this can take a while)...'
+
+        self.chkdst([dstzip, dstlog, dstmd5])
+
+        # Add relevant FileHandler to logging
+        self.add_logger_filehandler(dstlog)
+        self.logger.info('Processing cruise located in %s', srcdir)
+        self.logger.info('Start logging to %s', dstlog)
+
+        self.logger.info('Obtain list of files under %s', srcdir)
+        filelist, bytes_used = self.getfilelist(srcdir)
+        self.logger.info('Disk usage of %s is %s', srcdir, bytes2human(bytes_used))
+
+        # Calculate md5sum for every file on our list, in parallel
+        with Pool(processes=self.args.proccount) as pool:
+            btime = time.perf_counter()
+            self.logger.info(
+                'Calculate md5sum on %d files in %s %s',
+                len(filelist), srcdir, disclaimer)
+            try:
+                md5s = pool.map(self.md5sum, filelist)
+            finally:
+                pool.close()
+                pool.join()   # wait for all jobs to complete
+            md5s.sort()
+
+            # Save sorted list to a plaintext file
+            self.logger.info(
+                'md5sums calculated in %0.3f seconds, save results to %s',
+                time.perf_counter() - btime, dstmd5)
+            with open(dstmd5, 'w') as filep:
+                filep.write('\n'.join(
+                    ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
+
+        btime = time.perf_counter()
+        self.logger.info('Create %s %s', dstzip, disclaimer)
+        if self.args.extension == 'zip':
+            self.mkzip(dstzip, filelist)
+        else:
+            self.mktar(dstzip, filelist)
+        self.logger.info('Created %s in %0.3f seconds',
+                         dstzip, time.perf_counter() - btime)
+
+        zips = os.path.getsize(dstzip)
+        self.logger.info('Disk usage of %s is %s (%0.2f%% of %s)',
+                         dstzip, bytes2human(zips),
+                         100*(zips/bytes_used), srcdir)
+
+        self.logger.info('Total processing time for %s->%stook %0.3f seconds',
+                         srcdir, dstzip, time.perf_counter() - atime)
+
+        # Remove relevant FileHandler from logging
+        self.logger.info('End logging to %s', dstlog)
+        self.del_logger_filehandler()
+
+    def getlogger(self):
+        '''Set up class logger'''
+        self.logconf = argparse.Namespace(
+            consolehandler=logging.StreamHandler())
+        logger = logging.getLogger('CruisePack')
+
+        # pass all messages down to handlers
+        logger.setLevel(logging.DEBUG)
+
+        # console logger
+        self.logconf.consolehandler.setLevel(logging.INFO)
+        self.logconf.consolehandler.setFormatter(self.formatter)
+        logger.addHandler(self.logconf.consolehandler)
+
+        return logger
+
+    def add_logger_filehandler(self, dstlog):
+        '''Manage logging.FileHandler. We only ever have one open at
+           a time'''
+
+        try:
+            self.logconf.filehandler = logging.FileHandler(dstlog, mode='w')
+        except FileNotFoundError:
+            raise CPError('Not able to open log file %s!' % dstlog)
+
+        # Add new FileHandler to logger
+        self.logconf.filehandler.setFormatter(self.formatter)
+        self.logconf.filehandler.setLevel(logging.DEBUG)
+        self.logger.addHandler(self.logconf.filehandler)
+
+    def del_logger_filehandler(self):
+        '''Remove logging.FileHandler'''
+        if hasattr(self.logconf, 'filehandler'):
+            self.logger.removeHandler(self.logconf.filehandler)
+            del self.logconf.filehandler
+
+    @staticmethod
+    def parseargs():
+        '''parse STDIN, if any'''
+
+        parser = argparse.ArgumentParser(
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+            description='''
+                Build and execute a series of CLI rsync commands
+                in order to synchronize data from our
+                Data Acquisition Systems (DAS) to a central server.'''
+        )
+
+        parser.add_argument(
+            '-L', '--logpath',
+            dest='logpath',
+            default=Path.joinpath(Path(__file__).parents[1].absolute(),
+                                  'cruisepack.log'),
+            type=lambda p: Path(p).absolute(),
+            help='log file to write to')
+        parser.add_argument(
+            '-s', '--source-dir',
+            nargs='+',
+            default=[None],
+            help='source directory(s) of files to archive. Multiple sources' +
+            ' will create multiple destinations')
+        parser.add_argument(
+            '-d', '--destination-dir',
+            default=None,
+            nargs='+',
+            help='destination directiory(s) to write arcive to. When None, ' +
+            'the destination will be the parent dir of each source')
+        parser.add_argument(
+            '-e', '--extension',
+            type=str,
+            default='tar.bz2',
+            choices=('tar.bz2', 'zip'),
+            help='extension of target archive')
+        parser.add_argument(
+            '-D', '--delete-after',
+            action='store_true',
+            help='Delete source(s) after successfully writing destination(s).')
+        parser.add_argument(
+            '-O', '--overwrite-destination',
+            action='store_true',
+            help='Overwrite destination(s), if destination(s) exist.')
+        parser.add_argument(
+            '-p', '--proccount',
+            default=cpu_count()*2-1,
+            type=int,
+            help='number of parallel md5sum jobs to run')
+
+        return parser.parse_args()
+
+    @staticmethod
+    def validate_args(args):
+        '''Validate CLI arguments'''
+        if not isinstance(args.delete_after, bool):
+            raise CPError
+
+        if not isinstance(args.source_dir, list):
+            raise CPError
+        # Convert args to absolute path(s)
+        for i, val in enumerate(args.source_dir):
+            args.source_dir[i] = Path(val).absolute().__str__()
+
+        if args.destination_dir is None:
+            args.destination_dir = []
+            for i in args.source_dir:
+                args.destination_dir.append(
+                    Path(i).parent.absolute().__str__())
+
+        if not isinstance(args.destination_dir, list):
+            raise CPError
+
+        # Calculate destinations
+        dst = []
+
+        if len(args.destination_dir) == 1:
+            for i in args.source_dir:
+                dst.append(
+                    Path.joinpath(Path(args.destination_dir[0]),
+                                  '%s' % Path(i).name).__str__())
+        elif len(args.source_dir) == len(args.destination_dir):
+            for i, val in enumerate(args.destination_dir):
+                dst.append(
+                    Path.joinpath(Path(val),
+                                  '%s' % Path(
+                                      args.source_dir[i]).name).__str__())
+        else:
+            raise CPError(
+                "Don't know how to process %d sources and %d destinations"
+                % (len(args.source_dir), len(args.destination_dir)))
+
+        args.dstlog = ['%s.log.txt' % i for i in dst]
+        args.dstmd5 = ['%s.md5.txt' % i for i in dst]
+        args.dstzip = ['%s.%s' % (i, args.extension) for i in dst]
+
+        return args
+
+    def getfilelist(self, path):
+        '''Get a list of all files under a directory'''
+        filelist = []
+        size = 0
+
+        for root, dirs, files in os.walk(path):
+            for path in files:
+                fullpath = os.path.join(root, path)
+                filelist.append(fullpath)
+                size += os.stat(fullpath).st_size
+        return (filelist, size)
+
+    @staticmethod
+    def md5sum(path):
+        '''Open a file, calculate md5sum'''
+        hash_md5 = hashlib.md5()
+        with open(path, 'rb') as filep:
+            for chunk in iter(lambda: filep.read(4096), b""):
+                hash_md5.update(chunk)
+        return (path, hash_md5.hexdigest())
+
+    def mktar(self, filename, files):
+        '''Make a tar file based provided filename and list of files'''
+        with tarfile.open(filename, 'w:bz2') as archive:
+            for i in files:
+                archive.add(i)
+            #self.logger.debug(archive.list(verbose=True))
+
+    @staticmethod
+    def mkzip(filename, files):
+        '''Make a tar file based provided filename and list of files'''
+        try:
+            # Failover to LZMA if needed
+            archive = ZipFile(filename, 'w', compression=ZIP_BZIP2)
+        except NotImplementedError:
+            # If we don't have LZMA nor BZIP2 capability, fail
+            archive = ZipFile(filename, 'w', compression=ZIP_LZMA)
+        else:
+            for i in files:
+                archive.write(i)
+            archive.close()
+
+
+def main():
+    '''entry point when run from commandline'''
+    CruisePack()
+
+
+if __name__ == "__main__":
+    main()
