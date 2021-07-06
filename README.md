@@ -1,2 +1,4 @@
-# cruisepack
-STS cruise data packer
+# CruisePack
+STS cruise data packer, in Python
+
+Stay tuned.
