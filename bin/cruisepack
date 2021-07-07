@@ -20,7 +20,6 @@
  '''
 
 import argparse
-import collections
 import hashlib
 import logging
 import logging.handlers
@@ -34,16 +33,16 @@ from multiprocessing import Pool
 from pathlib import Path
 
 
-def bytes2human(n):
+def bytes2human(num):
+    '''Convert a number (bytes) to human-readable bytes'''
     symbols = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
     prefix = {}
-    for i, s in enumerate(symbols):
-        prefix[s] = 1 << (i+1)*10
-    for s in reversed(symbols):
-        if n >= prefix[s]:
-            value = float(n) / prefix[s]
-            return '%.1f%sB' % (value, s)
-    return '%sB' % n
+    for i, sym in enumerate(symbols):
+        prefix[sym] = 1 << (i+1)*10
+    for sym in reversed(symbols):
+        if num >= prefix[sym]:
+            return '%.1f%sB' % (num/prefix[sym], sym)
+    return '%sB' % num
 
 
 class CPError(Exception):
@@ -63,12 +62,12 @@ class CruisePack:
     '''Set up a class to pack cruise data'''
 
     def __init__(self):
-        self.args = self.validate_args(self.parseargs())
+        self.args = self.args_validate(self.args_parse())
 
         # Set up console logging
         self.formatter = logging.Formatter(
             '%(asctime)s %(levelname)7s: %(message)s')
-        self.logger = self.getlogger()
+        self.logger = self.logger_config()
 
         self.logger.info(self.args.__dict__)
 
@@ -76,125 +75,8 @@ class CruisePack:
             self.pack_cruise(srcdir, self.args.dstlog[i],
                              self.args.dstmd5[i], self.args.dstzip[i])
 
-    def chkdst(self, dstfiles):
-        '''Check to see if destination files exist and decide what to
-           about it'''
-        process = False
-        for i in dstfiles:
-            if not os.path.exists(i):  # good to go
-                process = True
-            elif self.args.overwrite_destination == True:  # also good
-                # Avoid overwriting file(s) if we did not call for it
-                self.logger.warning(
-                    '%s exists; overwrite_destination is enabled. Overwriting!',
-                    i)
-                process = True
-            else:
-                # Avoid overwriting file(s) if we did not call for it
-                self.logger.error(
-                    '%s exists and overwrite_destination not set.',
-                    i)
-                process = False
-        if process is False:
-            self.logger.warning('Exiting due to exisiting files.')
-            sys.exit(1)
-
-    def pack_cruise(self, srcdir, dstlog, dstmd5, dstzip):
-        '''Dig through a dir, md5sum every file and archive the dir'''
-        atime = time.perf_counter()
-        disclaimer = '(this can take a while)...'
-
-        self.chkdst([dstzip, dstlog, dstmd5])
-
-        # Add relevant FileHandler to logging
-        self.add_logger_filehandler(dstlog)
-        self.logger.info('Processing cruise located in %s', srcdir)
-        self.logger.info('Start logging to %s', dstlog)
-
-        self.logger.info('Obtain list of files under %s', srcdir)
-        filelist, bytes_used = self.getfilelist(srcdir)
-        self.logger.info('Disk usage of %s is %s', srcdir, bytes2human(bytes_used))
-
-        # Calculate md5sum for every file on our list, in parallel
-        with Pool(processes=self.args.proccount) as pool:
-            btime = time.perf_counter()
-            self.logger.info(
-                'Calculate md5sum on %d files in %s %s',
-                len(filelist), srcdir, disclaimer)
-            try:
-                md5s = pool.map(self.md5sum, filelist)
-            finally:
-                pool.close()
-                pool.join()   # wait for all jobs to complete
-            md5s.sort()
-
-            # Save sorted list to a plaintext file
-            self.logger.info(
-                'md5sums calculated in %0.3f seconds, save results to %s',
-                time.perf_counter() - btime, dstmd5)
-            with open(dstmd5, 'w') as filep:
-                filep.write('\n'.join(
-                    ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
-
-        btime = time.perf_counter()
-        self.logger.info('Create %s %s', dstzip, disclaimer)
-        if self.args.extension == 'zip':
-            self.mkzip(dstzip, filelist)
-        else:
-            self.mktar(dstzip, filelist)
-        self.logger.info('Created %s in %0.3f seconds',
-                         dstzip, time.perf_counter() - btime)
-
-        zips = os.path.getsize(dstzip)
-        self.logger.info('Disk usage of %s is %s (%0.2f%% of %s)',
-                         dstzip, bytes2human(zips),
-                         100*(zips/bytes_used), srcdir)
-
-        self.logger.info('Total processing time for %s->%stook %0.3f seconds',
-                         srcdir, dstzip, time.perf_counter() - atime)
-
-        # Remove relevant FileHandler from logging
-        self.logger.info('End logging to %s', dstlog)
-        self.del_logger_filehandler()
-
-    def getlogger(self):
-        '''Set up class logger'''
-        self.logconf = argparse.Namespace(
-            consolehandler=logging.StreamHandler())
-        logger = logging.getLogger('CruisePack')
-
-        # pass all messages down to handlers
-        logger.setLevel(logging.DEBUG)
-
-        # console logger
-        self.logconf.consolehandler.setLevel(logging.INFO)
-        self.logconf.consolehandler.setFormatter(self.formatter)
-        logger.addHandler(self.logconf.consolehandler)
-
-        return logger
-
-    def add_logger_filehandler(self, dstlog):
-        '''Manage logging.FileHandler. We only ever have one open at
-           a time'''
-
-        try:
-            self.logconf.filehandler = logging.FileHandler(dstlog, mode='w')
-        except FileNotFoundError:
-            raise CPError('Not able to open log file %s!' % dstlog)
-
-        # Add new FileHandler to logger
-        self.logconf.filehandler.setFormatter(self.formatter)
-        self.logconf.filehandler.setLevel(logging.DEBUG)
-        self.logger.addHandler(self.logconf.filehandler)
-
-    def del_logger_filehandler(self):
-        '''Remove logging.FileHandler'''
-        if hasattr(self.logconf, 'filehandler'):
-            self.logger.removeHandler(self.logconf.filehandler)
-            del self.logconf.filehandler
-
     @staticmethod
-    def parseargs():
+    def args_parse():
         '''parse STDIN, if any'''
 
         parser = argparse.ArgumentParser(
@@ -239,7 +121,7 @@ class CruisePack:
             action='store_true',
             help='Overwrite destination(s), if destination(s) exist.')
         parser.add_argument(
-            '-p', '--proccount',
+            '-p', '--proc-count',
             default=cpu_count()*2-1,
             type=int,
             help='number of parallel md5sum jobs to run')
@@ -247,7 +129,7 @@ class CruisePack:
         return parser.parse_args()
 
     @staticmethod
-    def validate_args(args):
+    def args_validate(args):
         '''Validate CLI arguments'''
         if not isinstance(args.delete_after, bool):
             raise CPError
@@ -292,17 +174,77 @@ class CruisePack:
 
         return args
 
-    def getfilelist(self, path):
+    def chkdst(self, dstfiles):
+        '''Check to see if destination files exist and decide what to
+           about it'''
+        process = False
+        for i in dstfiles:
+            if not os.path.exists(i):  # good to go
+                process = True
+            elif self.args.overwrite_destination is True:  # also good
+                # Avoid overwriting file(s) if we did not call for it
+                self.logger.warning(
+                    '%s exists. overwrite_destination enabled. Overwriting!',
+                    i)
+                process = True
+            else:
+                # Avoid overwriting file(s) if we did not call for it
+                self.logger.error(
+                    '%s exists and overwrite_destination not set.',
+                    i)
+                process = False
+        if process is False:
+            self.logger.warning('Exiting due to exisiting files.')
+            sys.exit(1)
+
+    @staticmethod
+    def getfilelist(path):
         '''Get a list of all files under a directory'''
         filelist = []
         size = 0
 
-        for root, dirs, files in os.walk(path):
-            for path in files:
-                fullpath = os.path.join(root, path)
+        for root, _, files in os.walk(path):
+            for myfile in files:
+                fullpath = os.path.join(root, myfile)
                 filelist.append(fullpath)
                 size += os.stat(fullpath).st_size
         return (filelist, size)
+
+    def logger_config(self):
+        '''Set up class logger'''
+        self.logconf = argparse.Namespace(
+            consolehdlr=logging.StreamHandler(), filehdlr=None)
+        logger = logging.getLogger('CruisePack')
+
+        # pass all messages down to handlers
+        logger.setLevel(logging.DEBUG)
+
+        # console logger
+        self.logconf.consolehdlr.setLevel(logging.INFO)
+        self.logconf.consolehdlr.setFormatter(self.formatter)
+        logger.addHandler(self.logconf.consolehdlr)
+
+        return logger
+
+    def logger_filehandler_add(self, dstlog):
+        '''Manage logging.FileHandler. We only ever have one open at
+           a time'''
+
+        try:
+            self.logconf.filehdlr = logging.FileHandler(dstlog, mode='w')
+        except FileNotFoundError:
+            raise CPError('Not able to open log file %s!' % dstlog)
+
+        # Add new FileHandler to logger
+        self.logconf.filehdlr.setFormatter(self.formatter)
+        self.logconf.filehdlr.setLevel(logging.DEBUG)
+        self.logger.addHandler(self.logconf.filehdlr)
+
+    def logger_filehandler_del(self):
+        '''Remove logging.FileHandler'''
+        if hasattr(self.logconf, 'filehdlr'):
+            self.logger.removeHandler(self.logconf.filehdlr)
+            del self.logconf.filehdlr
 
     @staticmethod
     def md5sum(path):
@@ -318,7 +260,7 @@ class CruisePack:
         with tarfile.open(filename, 'w:bz2') as archive:
             for i in files:
                 archive.add(i)
-            #self.logger.debug(archive.list(verbose=True))
+            self.logger.debug(archive.list(verbose=True))
 
     @staticmethod
     def mkzip(filename, files):
@@ -333,6 +275,65 @@ class CruisePack:
             for i in files:
                 archive.write(i)
             archive.close()
+
+    def pack_cruise(self, srcdir, dstlog, dstmd5, dstzip):
+        '''Dig through a dir, md5sum every file and archive the dir'''
+        atime = time.perf_counter()
+        disclaimer = '(this can take a while)...'
+
+        self.chkdst([dstzip, dstlog, dstmd5])
+
+        # Add relevant FileHandler to logging
+        self.logger_filehandler_add(dstlog)
+        self.logger.info('Processing cruise located in %s', srcdir)
+        self.logger.info('Start logging to %s', dstlog)
+
+        self.logger.info('Obtain list of files under %s', srcdir)
+        filelist, bytes_used = self.getfilelist(srcdir)
+        self.logger.info('Disk usage of %s is %s',
+                         srcdir, bytes2human(bytes_used))
+
+        # Calculate md5sum for every file on our list, in parallel
+        with Pool(processes=self.args.proc_count) as pool:
+            btime = time.perf_counter()
+            self.logger.info(
+                'Calculate md5sum on %d files in %s %s',
+                len(filelist), srcdir, disclaimer)
+            try:
+                md5s = pool.map(self.md5sum, filelist)
+            finally:
+                pool.close()
+                pool.join()   # wait for all jobs to complete
+            md5s.sort()
+
+            # Save sorted list to a plaintext file
+            self.logger.info(
+                'md5sums calculated in %0.3f seconds, save results to %s',
+                time.perf_counter() - btime, dstmd5)
+            with open(dstmd5, 'w') as filep:
+                filep.write('\n'.join(
+                    ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
+
+        btime = time.perf_counter()
+        self.logger.info('Create %s %s', dstzip, disclaimer)
+        if self.args.extension == 'zip':
+            self.mkzip(dstzip, filelist)
+        else:
+            self.mktar(dstzip, filelist)
+        self.logger.info('Created %s in %0.3f seconds',
+                         dstzip, time.perf_counter() - btime)
+
+        zips = os.path.getsize(dstzip)
+        self.logger.info('Disk usage of %s is %s (%0.2f%% of %s)',
+                         dstzip, bytes2human(zips),
+                         100*(zips/bytes_used), srcdir)
+
+        self.logger.info('Total processing time for %s->%stook %0.3f seconds',
+                         srcdir, dstzip, time.perf_counter() - atime)
+
+        # Remove relevant FileHandler from logging
+        self.logger.info('End logging to %s', dstlog)
+        self.logger_filehandler_del()
 
 
 def main():
