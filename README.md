@@ -3,7 +3,7 @@ STS cruise data packer, in Python
 
 Take the contents of a directory and turn each supplied argument
 into a `.tar.bz2` (or `.zip`), `.md5.txt` and `log.txt` file. If
-you are archiving a dataset of <=10GB (likely), it is recommended you
+you are archiving a dataset of >=10GB (likely), it is recommended you
 run this script in `screen`.
 
 ## Examples
