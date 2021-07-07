@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 
+# TODO: create archive file in a temp file, then move into place. This
+#       will allow for keyboard interrupts without destroying the old
+# TODO: tarball/zipfile begins with cruise dir as relative path
+
 '''cruisepack
-  Take the contents of a directory and turn each supplied argument
-  into a tarball, md5sum and log file. If you are archiving a
-  dataset of 10GB, it is recommended you run this script in `screen`.
-
- EXAMPLE:
-  cruisepack -s /share/cruises/foo/BAR1213 /share/cruises/foo/BAZ1214
-   ... would make:
-     /share/cruises/foo/BAR1213.zip
-     /share/cruises/foo/BAR1213.log.txt
-     /share/cruises/foo/BAR1213.md5.txt
-     /share/cruises/foo/BAZ1214.zip
-     /share/cruises/foo/BAZ1214.log.txt
-     /share/cruises/foo/BAZ1214.md5.txt
-
- It would be up to the user to delete /share/cruises/foo/BAR1213 and
- /share/cruises/foo/BAZ1214 in an effort to clean up space.
- '''
+    STS cruise data packer, in Python'''
 
 import argparse
 import hashlib
@@ -88,16 +76,9 @@ class CruisePack:
         )
 
         parser.add_argument(
-            '-L', '--logpath',
-            dest='logpath',
-            default=Path.joinpath(Path(__file__).parents[1].absolute(),
-                                  'cruisepack.log'),
-            type=lambda p: Path(p).absolute(),
-            help='log file to write to')
-        parser.add_argument(
             '-s', '--source-dir',
             nargs='+',
-            default=[None],
+            required=True,
             help='source directory(s) of files to archive. Multiple sources' +
             ' will create multiple destinations')
         parser.add_argument(
@@ -107,7 +88,7 @@ class CruisePack:
             help='destination directiory(s) to write arcive to. When None, ' +
             'the destination will be the parent dir of each source')
         parser.add_argument(
-            '-e', '--extension',
+            '-E', '--extension',
             type=str,
             default='tar.bz2',
             choices=('tar.bz2', 'zip'),
@@ -121,7 +102,7 @@ class CruisePack:
             action='store_true',
             help='Overwrite destination(s), if destination(s) exist.')
         parser.add_argument(
-            '-p', '--proc-count',
+            '-P', '--proc-count',
             default=cpu_count()*2-1,
             type=int,
             help='number of parallel md5sum jobs to run')
