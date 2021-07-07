@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 
-# TODO: create archive file in a temp file, then move into place. This
-#       will allow for keyboard interrupts without destroying the old
-# TODO: tarball/zipfile begins with cruise dir as relative path
-
 '''cruisepack
     STS cruise data packer, in Python'''
 
@@ -13,6 +9,7 @@ import logging
 import logging.handlers
 import os
 import tarfile
+import tempfile
 import time
 import sys
 from zipfile import ZipFile, ZIP_BZIP2, ZIP_LZMA
@@ -57,7 +54,7 @@ class CruisePack:
             '%(asctime)s %(levelname)7s: %(message)s')
         self.logger = self.logger_config()
 
-        self.logger.info(self.args.__dict__)
+        self.logger.info('CLI arguments: %s', self.args)
 
         for i, srcdir in enumerate(self.args.source_dir):
             self.pack_cruise(srcdir, self.args.dstlog[i],
@@ -188,7 +185,7 @@ class CruisePack:
             for myfile in files:
                 fullpath = os.path.join(root, myfile)
                 filelist.append(fullpath)
-                size += os.stat(fullpath).st_size
+                size += os.path.getsize(fullpath)
         return (filelist, size)
 
     def logger_config(self):
@@ -213,19 +210,13 @@ class CruisePack:
 
         try:
             self.logconf.filehdlr = logging.FileHandler(dstlog, mode='w')
-        except FileNotFoundError:
-            raise CPError('Not able to open log file %s!' % dstlog)
+        except (FileNotFoundError, PermissionError) as err:
+            raise CPError('Not able to open log file %s! %s' % (dstlog, err))
 
         # Add new FileHandler to logger
         self.logconf.filehdlr.setFormatter(self.formatter)
         self.logconf.filehdlr.setLevel(logging.DEBUG)
         self.logger.addHandler(self.logconf.filehdlr)
-
-    def logger_filehandler_del(self):
-        '''Remove logging.FileHandler'''
-        if hasattr(self.logconf, 'filehdlr'):
-            self.logger.removeHandler(self.logconf.filehdlr)
-            del self.logconf.filehdlr
 
     @staticmethod
     def md5sum(path):
@@ -236,31 +227,81 @@ class CruisePack:
                 hash_md5.update(chunk)
         return (path, hash_md5.hexdigest())
 
-    def mktar(self, filename, files):
+    def mktar(self, filename, files, md5file):
         '''Make a tar file based provided filename and list of files'''
-        with tarfile.open(filename, 'w:bz2') as archive:
-            for i in files:
-                archive.add(i)
-            self.logger.debug(archive.list(verbose=True))
-
-    @staticmethod
-    def mkzip(filename, files):
-        '''Make a tar file based provided filename and list of files'''
+        _, tmpf = tempfile.mkstemp(dir=Path(filename).parent,
+                                   prefix='%s.' % Path(filename).name)
+        self.logger.info('Write %s (will later move to %s).', tmpf, filename)
         try:
-            # Failover to LZMA if needed
-            archive = ZipFile(filename, 'w', compression=ZIP_BZIP2)
-        except NotImplementedError:
-            # If we don't have LZMA nor BZIP2 capability, fail
-            archive = ZipFile(filename, 'w', compression=ZIP_LZMA)
-        else:
-            for i in files:
-                archive.write(i)
-            archive.close()
+            with tarfile.open(tmpf, 'w:bz2') as archive:
+                archive.add(md5file)
+                for i in files:
+                    archive.add(i)
+                self.logger.debug(archive.list(verbose=True))
+        except KeyboardInterrupt:
+            self.logger.warning(
+                'Received keyboard interrupt. Deleting %s and quitting',
+                tmpf)
+            sys.exit(2)
+
+        self.logger.info('Wrote %s.', tmpf)
+
+        if self.args.overwrite_destination:
+            try:
+                os.remove(filename)
+            except FileNotFoundError:
+                pass
+        try:
+            self.logger.info('Move %s to %s.', tmpf, filename)
+            os.rename(tmpf, filename)
+        except FileExistsError:
+            self.logger.error('%s exists. Deleting %s.', filename, tmpf)
+            os.remove(tmpf)
+            return
+
+    def mkzip(self, filename, files, md5file):
+        '''Make a tar file based provided filename and list of files'''
+        _, tmpf = tempfile.mkstemp(dir=Path(filename).parent,
+                                   prefix='%s.' % Path(filename).name)
+        self.logger.info('Write %s (will later move to %s).', tmpf, filename)
+        try:
+            try:
+                # Failover to LZMA if needed
+                archive = ZipFile(tmpf, 'w', compression=ZIP_BZIP2)
+            except NotImplementedError:
+                # If we don't have LZMA nor BZIP2 capability, fail
+                archive = ZipFile(tmpf, 'w', compression=ZIP_LZMA)
+            else:
+                archive.write(md5file)
+                for i in files:
+                    archive.write(i)
+                archive.close()
+        except KeyboardInterrupt:
+            self.logger.warning(
+                'Received keyboard interrupt. Deleting %s and quitting',
+                tmpf)
+            sys.exit(2)
+
+        self.logger.info('Wrote %s.', tmpf)
+
+        if self.args.overwrite_destination:
+            try:
+                os.remove(filename)
+            except FileNotFoundError:
+                pass
+        try:
+            self.logger.info('Move %s to %s.', tmpf, filename)
+            os.rename(tmpf, filename)
+        except FileExistsError:
+            self.logger.error('%s exists. Deleting %s.', filename, tmpf)
+            os.remove(tmpf)
+            return
 
     def pack_cruise(self, srcdir, dstlog, dstmd5, dstzip):
         '''Dig through a dir, md5sum every file and archive the dir'''
         atime = time.perf_counter()
         disclaimer = '(this can take a while)...'
+        srcpath = Path(srcdir)
 
         self.chkdst([dstzip, dstlog, dstmd5])
 
@@ -269,52 +310,68 @@ class CruisePack:
         self.logger.info('Processing cruise located in %s', srcdir)
         self.logger.info('Start logging to %s', dstlog)
 
-        self.logger.info('Obtain list of files under %s', srcdir)
-        filelist, bytes_used = self.getfilelist(srcdir)
-        self.logger.info('Disk usage of %s is %s',
-                         srcdir, bytes2human(bytes_used))
+        cwd = os.getcwd()
 
-        # Calculate md5sum for every file on our list, in parallel
-        with Pool(processes=self.args.proc_count) as pool:
-            btime = time.perf_counter()
-            self.logger.info(
-                'Calculate md5sum on %d files in %s %s',
-                len(filelist), srcdir, disclaimer)
-            try:
-                md5s = pool.map(self.md5sum, filelist)
-            finally:
-                pool.close()
-                pool.join()   # wait for all jobs to complete
-            md5s.sort()
-
-            # Save sorted list to a plaintext file
-            self.logger.info(
-                'md5sums calculated in %0.3f seconds, save results to %s',
-                time.perf_counter() - btime, dstmd5)
-            with open(dstmd5, 'w') as filep:
-                filep.write('\n'.join(
-                    ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
-
-        btime = time.perf_counter()
-        self.logger.info('Create %s %s', dstzip, disclaimer)
-        if self.args.extension == 'zip':
-            self.mkzip(dstzip, filelist)
+        try:
+            self.logger.info('Change directory from %s to %s',
+                             cwd, srcpath.parent.__str__())
+            os.chdir(srcpath.parent.__str__())
+        except (FileNotFoundError, PermissionError) as err:
+            self.logger.error(
+                'Cannot `cd` to %s. Skip processing %s. %s',
+                srcpath.parent.__str__(), srcdir, err)
+            return
         else:
-            self.mktar(dstzip, filelist)
-        self.logger.info('Created %s in %0.3f seconds',
-                         dstzip, time.perf_counter() - btime)
+            self.logger.info('Obtain list of files under %s', srcpath.name)
+            filelist, bytes_used = self.getfilelist(srcpath.name)
+            self.logger.info('Disk usage of %s is %s',
+                             srcdir, bytes2human(bytes_used))
 
-        zips = os.path.getsize(dstzip)
-        self.logger.info('Disk usage of %s is %s (%0.2f%% of %s)',
-                         dstzip, bytes2human(zips),
-                         100*(zips/bytes_used), srcdir)
+            # Calculate md5sum for every file on our list, in parallel
+            with Pool(processes=self.args.proc_count) as pool:
+                btime = time.perf_counter()
+                self.logger.info(
+                    'Calculate md5sum on %d files in %s %s',
+                    len(filelist), srcpath.name, disclaimer)
+                try:
+                    md5s = pool.map(self.md5sum, filelist)
+                finally:
+                    pool.close()
+                    pool.join()   # wait for all jobs to complete
+                md5s.sort()
 
-        self.logger.info('Total processing time for %s->%stook %0.3f seconds',
-                         srcdir, dstzip, time.perf_counter() - atime)
+                # Save sorted list to a plaintext file
+                self.logger.info(
+                    'md5sums calculated in %0.3f seconds, save results to %s',
+                    time.perf_counter() - btime, dstmd5)
+                with open(dstmd5, 'w') as filep:
+                    filep.write('\n'.join(
+                        ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
+
+            btime = time.perf_counter()
+            self.logger.info('Create %s %s', dstzip, disclaimer)
+            if self.args.extension == 'zip':
+                self.mkzip(dstzip, filelist, Path(dstmd5).name)
+            else:
+                self.mktar(dstzip, filelist, Path(dstmd5).name)
+            self.logger.info('Created %s in %0.3f seconds',
+                             dstzip, time.perf_counter() - btime)
+
+            zips = os.path.getsize(dstzip)
+            self.logger.info('Disk usage of %s is %s (%0.2f%% of %s)',
+                             dstzip, bytes2human(zips),
+                             100*(zips/bytes_used), srcdir)
+        finally:
+            self.logger.info('Change directory from %s to %s',
+                             srcpath.parent.__str__(), cwd)
+            os.chdir(cwd)
+
+        self.logger.info('Total processing time for %s %0.3f seconds',
+                         srcdir, time.perf_counter() - atime)
 
         # Remove relevant FileHandler from logging
         self.logger.info('End logging to %s', dstlog)
-        self.logger_filehandler_del()
+        self.logconf.filehdlr = None
 
 
 def main():
