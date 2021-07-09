@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 
-# TODO: deal with errant symlinks; they presently cause an exception
+# TODO: deal with errant symlinks; they cause an exception in os.path.getsize
+# TODO: erase source dir when user requests it
 
 '''cruisepack
     STS cruise data packer, in Python'''
 
 import argparse
+import bz2
+import gzip
 import hashlib
 import logging
 import logging.handlers
+import lzma
 import os
 import tarfile
 import tempfile
 import time
 import sys
+from datetime import timedelta
 from json import dumps
 from multiprocessing import cpu_count
 from multiprocessing import Pool
 from multiprocessing.dummy import Pool as DummyPool
 from pathlib import Path
+from shutil import copyfileobj
 from zipfile import ZipFile, ZIP_BZIP2, ZIP_LZMA
 
 
@@ -41,7 +47,11 @@ class CruisePack:
                            ('hour', 3600), ('min', 60), ('second', 1))
 
     def __init__(self):
+        atime = time.perf_counter()
         self.args = self.args_validate(self.args_parse())
+
+        # Set up an empty list for self.args.compress_after == True
+        self.compress_after = []
 
         # Set up console logging
         self.formatter = logging.Formatter(
@@ -54,6 +64,14 @@ class CruisePack:
         for i, srcdir in enumerate(self.args.source_dir):
             self.pack_dir(srcdir, self.args.dstlog[i],
                           self.args.dstmd5[i], self.args.dstzip[i])
+
+        # Multithread compression at the end, when requested
+        if len(self.compress_after) > 0:
+            self.logger.info('Compressing delayed tarballs')
+            with DummyPool(processes=self.args.proc_count) as pool:
+                pool.starmap(self.compress, self.compress_after)
+
+        self.logger.info('Completed all processing. %s', self.timesince(atime))
 
     @staticmethod
     def args_parse():
@@ -80,16 +98,26 @@ class CruisePack:
             help='destination directiory(s) to write arcive to. When None, ' +
             'the destination will be the parent dir of each source')
         parser.add_argument(
-            '-E', '--extension',
-            type=str,
-            default='tar.bz2',
-            choices=('tar.bz2', 'zip'),
-            help='extension of target archive. NOTE: zip processing is ' +
-            'in series whereas tar.bz2 is multithreaded')
+            '-C', '--compress-after',
+            action='store_true',
+            help='Compress tarball(s) after successfully writing to all ' +
+            'destination(s). Given ample disk space, this can be useful ' +
+            'for batch copying multiple cruise datasets to the archival ' +
+            'space as quickly as possible, then running compression, which ' +
+            'takes the longest amount of time. Futher, since compression is ' +
+            'a singleton process, mutlithreading a number of jobs at the ' +
+            'end can mean less overall wait time, when important')
         parser.add_argument(
             '-D', '--delete-after',
             action='store_true',
             help='Delete source(s) after successfully writing destination(s).')
+        parser.add_argument(
+            '-E', '--extension',
+            type=str,
+            default='tar.bz2',
+            choices=('tar.bz2', 'tar.gz', 'tar.xz', 'tar', 'zip'),
+            help='extension of target archive. NOTE: zip processing is ' +
+            'in series whereas tar.bz2 is multithreaded')
         parser.add_argument(
             '-O', '--overwrite-destination',
             action='store_true',
@@ -152,6 +180,10 @@ class CruisePack:
         '''Check to see if destination files exist and decide what to
            about it'''
         process = False
+        if isinstance(dstfiles, str):  # ensure list
+            dstfiles = [dstfiles]
+        if not isinstance(dstfiles, list):  # ensure list
+            raise CPError('chkdst requires a str on list of str')
         for i in dstfiles:
             if not os.path.exists(i):  # good to go
                 process = True
@@ -171,6 +203,46 @@ class CruisePack:
             self.logger.warning('Exiting due to exisiting files.')
             sys.exit(1)
 
+    def compress(self, src, dst, compress):
+        '''Compress a file'''
+        # Validation
+        self.chkdst(dst)
+        if compress not in ('bz2', 'gz', 'xz'):
+            raise CPError('Unsupported compression type, %s' % compress)
+        srcsize = os.path.getsize(src)
+
+        # Create compressed file
+        atime = time.perf_counter()
+        self.logger.info('Compress %s to %s (this can take a while...)',
+                         src, dst)
+
+        try:
+            with open(src, 'rb') as fpsrc:
+                if compress == 'bz2':
+                    with bz2.open(dst, 'wb') as fpdst:
+                        copyfileobj(fpsrc, fpdst)
+                elif compress == 'gz':
+                    with gzip.open(dst, 'wb') as fpdst:
+                        copyfileobj(fpsrc, fpdst)
+                elif compress == 'xz':
+                    with lzma.open(dst, 'wb') as fpdst:
+                        copyfileobj(fpsrc, fpdst)
+        except KeyboardInterrupt:
+            self.logger.warning(
+                'Received keyboard interrupt. Deleting %s and quitting',
+                dst)
+            os.unlink(dst)
+            sys.exit(3)
+
+        self.logger.info('Done creating %s. %s', dst, self.timesince(atime))
+        dstsize = os.path.getsize(dst)
+        self.logger.info(
+            'Disk usage of %s is %s (%0.2f%% smaller than %s)', dst,
+            self.humanbytes(dstsize), 100-100*(dstsize/srcsize), src)
+        self.logger.debug('Attempt to delete %s.', src)
+        os.unlink(src)
+        self.logger.debug('Deleted %s.', src)
+
     def getfilelist(self, path):
         '''Get a list of all files under a directory'''
         filelist = []
@@ -182,7 +254,7 @@ class CruisePack:
                 fullpath = os.path.join(root, myfile)
                 filelist.append(fullpath)
         self.logger.info('Found %d files in %s. %s',
-                         len(filelist), path, self.time_since(atime))
+                         len(filelist), path, self.timesince(atime))
         return filelist
 
     @staticmethod
@@ -196,20 +268,6 @@ class CruisePack:
             if num >= prefix[sym]:
                 return '%.1f%sB' % (num/prefix[sym], sym)
         return '%sB' % num
-
-    def humanseconds(self, seconds):
-        if seconds == 0:
-            return 'inf'
-        elif seconds < 60:
-            return '%0.3f seconds' % seconds
-
-        parts = []
-        for unit, div in self.TIME_DURATION_UNITS:
-            amount, seconds = divmod(int(seconds), div)
-            if amount > 0:
-                parts.append('{} {}{}'.format(
-                    amount, unit, '' if amount == 1 else 's'))
-        return ', '.join(parts)
 
     def logger_config(self):
         '''Set up class logger'''
@@ -245,23 +303,49 @@ class CruisePack:
     def md5sum(path):
         '''Open a file, calculate md5sum'''
         hash_md5 = hashlib.md5()
-        with open(path, 'rb') as filep:
-            for chunk in iter(lambda: filep.read(4096), b""):
-                hash_md5.update(chunk)
+        try:
+            with open(path, 'rb') as filep:
+                for chunk in iter(lambda: filep.read(4096), b""):
+                    hash_md5.update(chunk)
+        except FileNotFoundError as err:
+            # Sometimes datasets have symlinks from other filesystems
+            # that will not resolve, so we'll just note that
+            if os.path.islink(path):
+                return (path, 'Nonsense symlink')
+            else:
+                raise CPError(err)
         return (path, hash_md5.hexdigest())
 
     def mkarchive(self, filename, files, md5file):
         '''Make a supported archive file'''
+        self.logger.debug('"%s" mode selected', self.args.extension)
+
+        # Rename compressed tarball filename to just .tar
+        compression = False
+        if filename.endswith(('.tar.bz2', '.tar.gz', '.tar.xz')):
+            strings = filename.split('.')
+            filename_orig = filename
+            filename = '.'.join(strings[:-1])
+            compression = strings[-1]
+            self.logger.info(
+                'Compression "%s" will be processed after tarball creation.',
+                compression)
+
+        # Calculate a unique filename in our destination dir
         _, tmpf = tempfile.mkstemp(dir=Path(filename).parent,
                                    prefix='%s.' % Path(filename).name)
-        self.logger.debug('"%s" mode selected', self.args.extension)
+
         self.logger.info('Write %s (will later move to %s).', tmpf, filename)
 
         try:
             if self.args.extension == 'zip':
-                self.mkzip(tmpf, files, md5file)
+                # stackoverflow.com/questions/9195206/is-python-zipfile-thread-safe
+                # zipfile is supposedly thread safe, but not in testing.
+                # Limit threadcount to 1 to avoid concurrency errors.
+                self.mkzip(tmpf, files, md5file, 1)
             else:
-                self.mktar(tmpf, files, md5file)
+                # Compression is based on extension selected
+                self.mktar(tmpf, files, md5file, self.args.proc_count)
         except KeyboardInterrupt:
             self.logger.warning(
                 'Received keyboard interrupt. Deleting %s and quitting',
@@ -271,32 +355,43 @@ class CruisePack:
 
         self.logger.info('Wrote %s.', tmpf)
 
-        try:
-            self.logger.info('Move %s to %s.', tmpf, filename)
-            os.rename(tmpf, filename)
-        except FileExistsError:
-            if self.args.overwrite_destination:
-                self.logger.debug('%s exists. Removing.', filename)
-                os.remove(filename)
-                os.rename(tmpf, filename)
-                return
+        self.move(tmpf, filename)
 
-            self.logger.error(
-                '%s already exists. Quit and clean up %s.',
-                filename, tmpf)
-            os.remove(tmpf)
-            sys.exit(3)
+        self.logger.info('%s size is %s; mdsum is %s',
+                         filename,
+                         self.humanbytes(os.path.getsize(filename)),
+                         self.md5sum(filename)[1])
 
-    def mktar(self, filename, files, md5file):
+        # Conditionally compress file (now or later) and return filename
+        # of where we are leaving things.
+        if compression:
+            if self.args.compress_after:
+                self.compress_after.append((filename, filename_orig,
+                                            compression))
+                self.logger.warning('Creating %s->%s has been delayed',
+                                    filename, filename_orig)
+                return filename
+            else:
+                self.compress(filename, filename_orig, compression)
+                return filename_orig
+        return filename
+
+    @staticmethod
+    def mktar(filename, files, md5file, threadcount):
         '''Make a tarball based provided filename and list of files'''
-        with tarfile.open(filename, 'w:bz2') as archive:
+
+        # Only write an uncompressed .tar file; we want to copy raw
+        # bytes to our archive location as quickly as possible, and
+        # then save disk space, afterwards.
+        with tarfile.open(filename, 'w:') as archive:
             archive.add(md5file)
             # Multithread add files to our archive. This speeds things
             # up, but not dramatically.
-            with DummyPool(processes=self.args.proc_count) as pool:
+            with DummyPool(processes=threadcount) as pool:
                 pool.map(archive.add, files)
 
-    def mkzip(self, filename, files, md5file):
+    @staticmethod
+    def mkzip(filename, files, md5file, threadcount):
         '''Make a zip file based provided filename and list of files'''
         try:
             # Failover to LZMA if needed
@@ -308,12 +403,29 @@ class CruisePack:
             archive.write(md5file)
             # Multithread add files to our archive. This speeds things
             # up, but not dramatically.
-            # stackoverflow.com/questions/9195206/is-python-zipfile-thread-safe
-            # zipfile is supposedly thread safe, but not in testing.
-            # Run serially for now by limiting threads to 1.
-            with DummyPool(processes=1) as pool:
+            with DummyPool(processes=threadcount) as pool:
                 pool.map(archive.write, files)
             archive.close()
+
+    def move(self, src, dst):
+        '''Move a file'''
+        self.chkdst(dst)
+        try:
+            self.logger.info('Move %s to %s.', src, dst)
+            os.rename(src, dst)
+        except FileExistsError:
+            if self.args.overwrite_destination:
+                self.logger.warning('%s exists. Removing.', dst)
+                os.remove(dst)
+                os.rename(src, dst)
+                return
+            self.logger.error(
+                '%s already exists. Quit and clean up %s.',
+                dst, src)
+            os.remove(src)
+            sys.exit(3)
+        except PermissionError as err:
+            raise CPError('Cannot move %s to %s. %s' % (src, dst, err))
 
     def pack_dir(self, srcdir, dstlog, dstmd5, dstzip):
         '''Dig through a dir, md5sum every file and archive the dir'''
@@ -353,7 +465,7 @@ class CruisePack:
                 self.logger.info(
                     'Total disk usage of %s: %s. %s',
                     srcpath.name, self.humanbytes(bytes_used),
-                    self.time_since(btime))
+                    self.timesince(btime))
 
                 # Calculate md5sum for every file on our list
                 ctime = time.perf_counter()
@@ -366,36 +478,33 @@ class CruisePack:
                 # Save sorted list to a plaintext file
                 self.logger.info(
                     'md5sum results saved to %s. %s',
-                    dstmd5, self.time_since(ctime))
+                    dstmd5, self.timesince(ctime))
                 with open(dstmd5, 'w') as filep:
                     filep.write('\n'.join(
                         ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
 
             dtime = time.perf_counter()
             self.logger.info('Create %s %s', dstzip, disclaimer)
-            self.mkarchive(dstzip, filelist, dstmd5)
-            self.logger.info('Created %s. %s', dstzip,
-                             self.time_since(dtime))
-
-            zips = os.path.getsize(dstzip)
-            self.logger.info(
-                'Disk usage of %s is %s (%0.2f%% smaller than %s)', dstzip,
-                self.humanbytes(zips), 100-100*(zips/bytes_used), srcdir)
+            filename = self.mkarchive(dstzip, filelist, dstmd5)
+            self.logger.info('Created %s. %s', filename,
+                             self.timesince(dtime))
 
         self.logger.info('Change directory from %s to %s',
                          srcpath.parent.__str__(), cwd)
         os.chdir(cwd)
 
         self.logger.info('Done processing %s. %s', srcdir,
-                         self.time_since(atime))
+                         self.timesince(atime))
 
         # Remove relevant FileHandler from logging
         self.logger.info('End logging to %s', dstlog)
         self.logconf.filehdlr = None
 
-    def time_since(self, seconds):
-        return 'Calculated in %s' % self.humanseconds(
-            time.perf_counter() - seconds)
+    @staticmethod
+    def timesince(seconds):
+        '''Utility function to format timedelta for logging'''
+        return 'Total time ellapsed: %s' % timedelta(
+            seconds=time.perf_counter() - seconds)
 
 
 def main():
