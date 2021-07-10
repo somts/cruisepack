@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-# TODO: deal with errant symlinks; they cause an exception in os.path.getsize
 # TODO: erase source dir when user requests it
 
 '''cruisepack
@@ -8,6 +7,7 @@
 
 import argparse
 import bz2
+import contextlib
 import gzip
 import hashlib
 import logging
@@ -26,6 +26,19 @@ from multiprocessing.dummy import Pool as DummyPool
 from pathlib import Path
 from shutil import copyfileobj
 from zipfile import ZipFile, ZIP_BZIP2, ZIP_LZMA
+
+
+@contextlib.contextmanager
+def pushd(new_dir):
+    '''overloaded method for contextmanager to pushd/popd, Python-style
+       using the "with" statement. For details, see
+       stackoverflow.com/questions/6194499/pushd-through-os-system'''
+    previous_dir = os.getcwd()
+    os.chdir(new_dir)
+    try:
+        yield
+    finally:
+        os.chdir(previous_dir)
 
 
 class CPError(Exception):
@@ -48,6 +61,7 @@ class CruisePack:
 
     def __init__(self):
         atime = time.perf_counter()
+        self.disclaimer = '(this can take a while...)'
         self.args = self.args_validate(self.args_parse())
 
         # Set up an empty list for self.args.compress_after == True
@@ -213,8 +227,7 @@ class CruisePack:
 
         # Create compressed file
         atime = time.perf_counter()
-        self.logger.info('Compress %s to %s (this can take a while...)',
-                         src, dst)
+        self.logger.info('Compress %s to %s %s', src, dst, self.disclaimer)
 
         try:
             with open(src, 'rb') as fpsrc:
@@ -256,6 +269,66 @@ class CruisePack:
         self.logger.info('Found %d files in %s. %s',
                          len(filelist), path, self.timesince(atime))
         return filelist
+
+    def getfilesize(self, path):
+        '''wrapper method of os.path.getsize() to deal with errant
+           symlinks; they cause an exception, but we do not care.
+           We'll just log that it happened and move on'''
+        try:
+            return os.path.getsize(path)
+        except FileNotFoundError as err:
+            # Sometimes datasets have symlinks from other filesystems
+            # that will not resolve to the original file they're linked
+            # to.  While not great, we don't care that hard, so we'll
+            # just note that it happened and move on
+            if os.path.islink(path):
+                self.logger.warning(
+                    '%s generated an error, but is a symlink. Ignoring.',
+                    path)
+                return 0
+
+            # Some condition we did not expect? Raise an exception
+            raise CPError(err)
+
+    def getmeta_filesize(self, path, filelist):
+        '''file size metadata operations'''
+        atime = time.perf_counter()
+        self.logger.info(
+            'Calculate total disk size used by %d files in %s %s',
+            len(filelist), path, self.disclaimer)
+
+        # Calculate sum of file sizes for every file on our list
+        # Multithreaded, despite multiprocess being better for
+        # I/O-bound tasks. This is because this task is not very
+        # slow, and multithread makes it easy for logging of warnings
+        with DummyPool(processes=self.args.proc_count) as pool:
+            bytes_used = sum(pool.map(self.getfilesize, filelist))
+
+        self.logger.info('Total disk usage of %s: %s. %s',
+                         path, self.humanbytes(bytes_used),
+                         self.timesince(atime))
+        return bytes_used
+
+    def getmeta_md5sum(self, path, filelist, md5path):
+        '''md5 metadata operations'''
+        atime = time.perf_counter()
+        self.logger.info('Calculate md5sum on %d files in %s %s',
+                         len(filelist), path, self.disclaimer)
+
+        # Calculate md5sum for every file on our list. Multiprocess for
+        # best performance for these CPU-bound and I/O-bound tasks.
+        with Pool(processes=self.args.proc_count) as pool:
+            md5s = pool.map(self.md5sum, filelist)
+        md5s.sort()
+
+        # Save sorted list to a plaintext file
+        self.logger.debug('Attempt to save md5sum results saved to %s',
+                          md5path)
+        with open(md5path, 'w') as filep:
+            filep.write('\n'.join(
+                ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
+        self.logger.info('md5sum results saved to %s. %s',
+                         md5path, self.timesince(atime))
 
     @staticmethod
     def humanbytes(num):
@@ -305,19 +378,22 @@ class CruisePack:
         hash_md5 = hashlib.md5()
         try:
             with open(path, 'rb') as filep:
-                for chunk in iter(lambda: filep.read(4096), b""):
+                for chunk in iter(lambda: filep.read(4096), b''):
                     hash_md5.update(chunk)
         except FileNotFoundError as err:
-            # Sometimes datasets have symlinks from other filesystems
-            # that will not resolve, so we'll just note that
+            # If we got a symlink that points to some non-local
+            # file, we do not care that hard; make a dummy hash
+            # and move on
             if os.path.islink(path):
-                return (path, 'Nonsense symlink')
-            else:
-                raise CPError(err)
+                return (path, '00000000000000000000000000000000')
+            # Fail otherwise
+            raise CPError(err)
         return (path, hash_md5.hexdigest())
 
     def mkarchive(self, filename, files, md5file):
         '''Make a supported archive file'''
+        atime = time.perf_counter()
+        self.logger.info('Create %s %s', filename, self.disclaimer)
         self.logger.debug('"%s" mode selected', self.args.extension)
 
         # Rename compressed tarball filename to just .tar
@@ -339,13 +415,10 @@ class CruisePack:
 
         try:
             if self.args.extension == 'zip':
-                # stackoverflow.com/questions/9195206/is-python-zipfile-thread-safe
-                # zipfile is supposedly thread safe, but not in testing.
-                # Limit threadcount to 1 to avoid concurrency errors.
-                self.mkzip(tmpf, files, md5file, 1)
+                self.mkzip(tmpf, files, md5file)
             else:
                 # Compression is based on extension selected
-                self.mktar(tmpf, files, md5file, self.args.proc_count)
+                self.mktar(tmpf, files, md5file)
         except KeyboardInterrupt:
             self.logger.warning(
                 'Received keyboard interrupt. Deleting %s and quitting',
@@ -371,27 +444,40 @@ class CruisePack:
                 self.logger.warning('Creating %s->%s has been delayed',
                                     filename, filename_orig)
                 return filename
-            else:
-                self.compress(filename, filename_orig, compression)
-                return filename_orig
+
+            self.compress(filename, filename_orig, compression)
+            return filename_orig
+
+        self.logger.info('Created %s. %s', filename, self.timesince(atime))
         return filename
 
     @staticmethod
-    def mktar(filename, files, md5file, threadcount):
+    def mktar(filename, files, md5file):
         '''Make a tarball based provided filename and list of files'''
 
         # Only write an uncompressed .tar file; we want to copy raw
         # bytes to our archive location as quickly as possible, and
         # then save disk space, afterwards.
         with tarfile.open(filename, 'w:') as archive:
-            archive.add(md5file)
-            # Multithread add files to our archive. This speeds things
-            # up, but not dramatically.
-            with DummyPool(processes=threadcount) as pool:
-                pool.map(archive.add, files)
+
+            # First, archive our md5sum file and then delete it
+            md5path = Path(md5file)
+            with pushd(md5path.parent):
+                archive.add(md5path.name)
+            os.unlink(md5file)
+
+            # Multithreading or multiprocessing would be nice, here.
+            # However, even when seemingly supported, neither seems
+            # truly ready for use.  In testing, even when no expections
+            # occurred, resulting tarballs were corrupt. Regardless of
+            # data integrity, performance improvements were also not
+            # dramatically better. For now, we just add files to the
+            # archive, in series, in order to play it safest.
+            for myf in files:
+                archive.add(myf)
 
     @staticmethod
-    def mkzip(filename, files, md5file, threadcount):
+    def mkzip(filename, files, md5file):
         '''Make a zip file based provided filename and list of files'''
         try:
             # Failover to LZMA if needed
@@ -400,11 +486,16 @@ class CruisePack:
             # If we don't have LZMA nor BZIP2 capability, fail
             archive = ZipFile(filename, 'w', compression=ZIP_LZMA)
         else:
-            archive.write(md5file)
-            # Multithread add files to our archive. This speeds things
-            # up, but not dramatically.
-            with DummyPool(processes=threadcount) as pool:
-                pool.map(archive.write, files)
+            # First, archive our md5sum file and then delete it
+            md5path = Path(md5file)
+            with pushd(md5path.parent):
+                archive.write(md5path.name)
+            os.unlink(md5file)
+
+            # See multithreading note in self.mktar(). Just add files
+            # in series, for now
+            for myf in files:
+                archive.write(myf)
             archive.close()
 
     def move(self, src, dst):
@@ -430,8 +521,6 @@ class CruisePack:
     def pack_dir(self, srcdir, dstlog, dstmd5, dstzip):
         '''Dig through a dir, md5sum every file and archive the dir'''
         atime = time.perf_counter()
-        disclaimer = '(this can take a while)...'
-        srcpath = Path(srcdir)
 
         self.chkdst([dstzip, dstlog, dstmd5])
 
@@ -440,58 +529,17 @@ class CruisePack:
         self.logger.info('Processing directory %s', srcdir)
         self.logger.info('Start logging to %s', dstlog)
 
-        cwd = os.getcwd()
-
-        try:
-            self.logger.info('Change directory from %s to %s',
-                             cwd, srcpath.parent.__str__())
-            os.chdir(srcpath.parent.__str__())
-        except (FileNotFoundError, PermissionError) as err:
-            self.logger.error(
-                'Cannot `cd` to %s. Skip processing %s. %s',
-                srcpath.parent.__str__(), srcdir, err)
-            return
-        else:
+        # Tarballs and zipfiles should not have absolute paths in them,
+        # so we want to process our data in the parent of the directory
+        # in question.
+        srcpath = Path(srcdir)
+        with pushd(srcpath.parent.__str__()):
+            self.logger.info('Changed directory to %s',
+                             srcpath.parent.__str__())
             filelist = self.getfilelist(srcpath.name)
-
-            # Multiprocess file metadata operations
-            with Pool(processes=self.args.proc_count) as pool:
-                # Calculate sum of file sizes for every file on our list
-                btime = time.perf_counter()
-                self.logger.debug(
-                    'Calculate total disk size used by %d files in %s %s...',
-                    len(filelist), srcpath.name, disclaimer)
-                bytes_used = sum(pool.map(os.path.getsize, filelist))
-                self.logger.info(
-                    'Total disk usage of %s: %s. %s',
-                    srcpath.name, self.humanbytes(bytes_used),
-                    self.timesince(btime))
-
-                # Calculate md5sum for every file on our list
-                ctime = time.perf_counter()
-                self.logger.debug(
-                    'Calculate md5sum on %d files in %s %s...',
-                    len(filelist), srcpath.name, disclaimer)
-                md5s = pool.map(self.md5sum, filelist)
-                md5s.sort()
-
-                # Save sorted list to a plaintext file
-                self.logger.info(
-                    'md5sum results saved to %s. %s',
-                    dstmd5, self.timesince(ctime))
-                with open(dstmd5, 'w') as filep:
-                    filep.write('\n'.join(
-                        ['{}\t{}'.format(i[1], i[0]) for i in md5s]))
-
-            dtime = time.perf_counter()
-            self.logger.info('Create %s %s', dstzip, disclaimer)
-            filename = self.mkarchive(dstzip, filelist, dstmd5)
-            self.logger.info('Created %s. %s', filename,
-                             self.timesince(dtime))
-
-        self.logger.info('Change directory from %s to %s',
-                         srcpath.parent.__str__(), cwd)
-        os.chdir(cwd)
+            self.getmeta_filesize(srcpath.name, filelist)
+            self.getmeta_md5sum(srcpath.name, filelist, dstmd5)
+            self.mkarchive(dstzip, filelist, dstmd5)
 
         self.logger.info('Done processing %s. %s', srcdir,
                          self.timesince(atime))
