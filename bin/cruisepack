@@ -56,8 +56,6 @@ class CPError(Exception):
 
 class CruisePack:
     '''Set up a class to pack cruise data'''
-    TIME_DURATION_UNITS = (('week', 604800), ('day', 86400),
-                           ('hour', 3600), ('min', 60), ('second', 1))
 
     def __init__(self):
         atime = time.perf_counter()
