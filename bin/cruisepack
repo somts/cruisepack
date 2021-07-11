@@ -500,8 +500,8 @@ class CruisePack:
         '''Move a file'''
         self.chkdst(dst)
         try:
-            if self.args.overwrite_destination:
-                self.logger.info('Replace %s to %s.', src, dst)
+            if self.args.overwrite_destination and os.path.exists(dst):
+                self.logger.info('Overwrite %s with %s.', dst, src)
                 os.replace(src, dst)
             else:
                 self.logger.info('Rename %s to %s.', src, dst)
@@ -539,7 +539,7 @@ class CruisePack:
         else:
             # autofs files seem to return os.rename() faster than the file
             # truly moves. So, we double check our file was moved, here.
-            time.sleep(1)
+            time.sleep(10)
             while os.path.exists(src):
                 time.sleep(1)
 
