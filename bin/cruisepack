@@ -408,6 +408,7 @@ class CruisePack:
         # Calculate a unique filename in our destination dir
         _, tmpf = tempfile.mkstemp(dir=Path(filename).parent,
                                    prefix='%s.' % Path(filename).name)
+        os.close(_)
 
         self.logger.info('Write %s (will later move to %s).', tmpf, filename)
 
@@ -501,7 +502,7 @@ class CruisePack:
         self.chkdst(dst)
         try:
             if self.args.overwrite_destination and os.path.exists(dst):
-                self.logger.info('Overwrite %s with %s.', dst, src)
+                self.logger.warning('Overwrite %s with %s.', dst, src)
                 os.replace(src, dst)
             else:
                 self.logger.info('Rename %s to %s.', src, dst)
@@ -536,12 +537,6 @@ class CruisePack:
             self.logger.fatal(err)
             os.remove(src)
             sys.exit(6)
-        else:
-            # autofs files seem to return os.rename() faster than the file
-            # truly moves. So, we double check our file was moved, here.
-            time.sleep(10)
-            while os.path.exists(src):
-                time.sleep(1)
 
     def pack_dir(self, srcdir, dstlog, dstmd5, dstzip):
         '''Dig through a dir, md5sum every file and archive the dir'''
