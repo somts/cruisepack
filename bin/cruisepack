@@ -433,8 +433,8 @@ class CruisePack:
                          self.humanbytes(os.path.getsize(filename)),
                          self.md5sum(filename)[1])
 
-        # Conditionally compress file (now or later) and return filename
-        # of where we are leaving things.
+        # Conditionally compress file (now or later) and return
+        # filename of where we are leaving things.
         if compression:
             if self.args.compress_after:
                 self.compress_after.append((filename, filename_orig,
@@ -500,21 +500,48 @@ class CruisePack:
         '''Move a file'''
         self.chkdst(dst)
         try:
-            self.logger.info('Move %s to %s.', src, dst)
-            os.rename(src, dst)
-        except FileExistsError:
             if self.args.overwrite_destination:
-                self.logger.warning('%s exists. Removing.', dst)
-                os.remove(dst)
+                self.logger.info('Replace %s to %s.', src, dst)
+                os.replace(src, dst)
+            else:
+                self.logger.info('Rename %s to %s.', src, dst)
                 os.rename(src, dst)
-                return
-            self.logger.error(
-                '%s already exists. Quit and clean up %s.',
-                dst, src)
+        except FileExistsError:
+            self.logger.fatal('%s already exists. Quit, clean up %s.',
+                              dst, src)
             os.remove(src)
             sys.exit(3)
+
+        except IsADirectoryError:
+            self.logger.fatal(
+                'src %s is a file but dst %d is a directory. Quit, cleanup %s',
+                src, dst, src)
+            os.remove(src)
+            sys.exit(4)
+
+        except NotADirectoryError:
+            self.logger.fatal(
+                'src %s is a directory but dst %s is a file. Quit, cleanup %s',
+                src, dst, src)
+            os.remove(src)
+            sys.exit(5)
+
         except PermissionError as err:
-            raise CPError('Cannot move %s to %s. %s' % (src, dst, err))
+            self.logger.fatal('Operation not permitted. Quit, cleanup %s. %s',
+                              src, err)
+            os.remove(src)
+            sys.exit(6)
+
+        except OSError as err:
+            self.logger.fatal(err)
+            os.remove(src)
+            sys.exit(6)
+        else:
+            # autofs files seem to return os.rename() faster than the file
+            # truly moves. So, we double check our file was moved, here.
+            time.sleep(1)
+            while os.path.exists(src):
+                time.sleep(1)
 
     def pack_dir(self, srcdir, dstlog, dstmd5, dstzip):
         '''Dig through a dir, md5sum every file and archive the dir'''
